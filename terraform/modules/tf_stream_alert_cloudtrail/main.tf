@@ -143,14 +143,14 @@ resource "aws_cloudtrail" "streamalert_no_cloudwatch" {
 // CloudWatch Log group to send all CloudTrail logs to
 resource "aws_cloudwatch_log_group" "cloudtrail_logging" {
   count             = "${var.send_to_cloudwatch ? 1 : 0}"
-  name              = "CloudTrail/DefaultLogGroup"
+  name              = "${var.prefix}_CloudTrail/DefaultLogGroup"
   retention_in_days = 1
 }
 
 // IAM Role: Allow CloudTrail logs to send logs to CloudWatch Logs
 resource "aws_iam_role" "cloudtrail_to_cloudwatch_role" {
   count = "${var.send_to_cloudwatch ? 1 : 0}"
-  name  = "cloudtrail_to_cloudwatch_role"
+  name  = "${var.prefix}_cloudtrail_to_cloudwatch_role"
 
   assume_role_policy = "${data.aws_iam_policy_document.cloudtrail_to_cloudwatch_assume_role_policy.json}"
 }

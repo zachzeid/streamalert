@@ -70,6 +70,7 @@ def generate_cloudwatch(cluster_name, cluster_dict, config):
         cluster_dict['module']['cloudwatch_{}_{}'.format(cluster_name, region)] = {
             'source': 'modules/tf_stream_alert_cloudwatch',
             'region': region,
+            'prefix': config['global']['account']['prefix'],
             'cross_account_ids': cross_account_ids,
             'cluster': cluster_name,
             'kinesis_stream_arn': '${{module.kinesis_{}.arn}}'.format(cluster_name)

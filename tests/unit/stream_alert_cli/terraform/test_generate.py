@@ -392,6 +392,7 @@ class TestTerraformGenerate:
             'cluster': 'advanced',
             'source': 'modules/tf_stream_alert_cloudwatch',
             'region': 'eu-west-1',
+            'prefix': 'unit-testing',
             'kinesis_stream_arn': '${module.kinesis_advanced.arn}',
             'cross_account_ids': ['123456789012', '12345678910']
         }

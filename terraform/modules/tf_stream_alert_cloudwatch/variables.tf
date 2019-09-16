@@ -8,3 +8,5 @@ variable "cross_account_ids" {
   type    = "list"
   default = []
 }
+
+variable "prefix" {}
