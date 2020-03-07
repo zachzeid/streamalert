@@ -13,21 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-import base64
 from collections import defaultdict
-import json
 import os
-import re
-import time
-import zlib
 
 from mock import patch, MagicMock
 
 from streamalert.alert_processor import main as alert_processor
 from streamalert.alert_processor.helpers import compose_alert
 from streamalert.alert_processor.outputs.output_base import OutputDispatcher
-from streamalert.classifier import classifier
-from streamalert.classifier.parsers import ParserBase
 from streamalert.rules_engine import rules_engine
 from streamalert.shared import rule
 from streamalert.shared.logger import get_logger
@@ -470,5 +463,3 @@ class TestRunner:
             key = os.path.split(path)[1]
         key = key if not idx else '{}:{}'.format(key, idx)
         self._errors[key].append(error)
-
-
