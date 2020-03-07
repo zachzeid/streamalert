@@ -4,12 +4,18 @@ import re
 import time
 import zlib
 
-from mock import patch
+from mock import patch, MagicMock
 
+from streamalert.alert_processor import main as alert_processor
+from streamalert.alert_processor.helpers import compose_alert
+from streamalert.alert_processor.outputs.output_base import OutputDispatcher
 from streamalert.classifier import classifier
 from streamalert.classifier.parsers import ParserBase
+from streamalert.rules_engine import rules_engine
 from streamalert.shared import rule
 from streamalert.shared.logger import get_logger
+from streamalert.shared.lookup_tables.table import LookupTable
+from streamalert_cli.test.mocks import mock_threat_intel_query_results, mock_lookup_table_results
 
 LOGGER = get_logger(__name__)
 
@@ -94,6 +100,8 @@ class IntegrationTest:
         self._test_record = None
 
         self._s3_mocker = patch('streamalert.classifier.payload.s3.boto3.resource').start()
+        self._threat_intel_mock = mock_threat_intel_query_results()
+        self._lookup_tables_mock = mock_lookup_table_results()
 
         self._format_test_record()
 
@@ -142,12 +150,90 @@ class IntegrationTest:
             _classifier = classifier.Classifier()
             return _classifier.run(records=[self.record])
 
+    def run_rules(self, records):
+        """Create a fresh rules engine and process the record, returning the result"""
+        with patch.object(rules_engine.ThreatIntel, '_query') as ti_mock, \
+            patch.object(rules_engine, 'AlertForwarder'), \
+            patch.object(rules_engine, 'RuleTable') as rule_table, \
+            patch('rules.helpers.base.random_bool', return_value=True):
+            # Emptying out the rule table will force all rules to be unstaged, which causes
+            # non-required outputs to get properly populated on the Alerts that are generated
+            # when running the Rules Engine.
+            rule_table.return_value = False
+            ti_mock.side_effect = self._threat_intel_mock
+
+            _rules_engine = rules_engine.RulesEngine()
+
+            self._install_lookup_tables_mocks(_rules_engine)
+
+            return _rules_engine.run(records=records)
+
+    @staticmethod
+    def run_publishers(alert):
+        """Runs publishers for all currently configured outputs on the given alert
+
+        Args:
+            - alert (Alert): The alert
+
+        Returns:
+            dict: A dict keyed by output:descriptor strings, mapped to nested dicts.
+                  The nested dicts have 2 keys:
+                  - publication (dict): The dict publication
+                  - success (bool): True if the publishing finished, False if it errored.
+        """
+        configured_outputs = alert.outputs
+
+        results = {}
+        for configured_output in configured_outputs:
+            [output_name, descriptor] = configured_output.split(':')
+
+            try:
+                output = MagicMock(spec=OutputDispatcher, __service__=output_name)
+                results[configured_output] = {
+                    'publication': compose_alert(alert, output, descriptor),
+                    'success': True,
+                }
+            except (RuntimeError, TypeError, NameError) as err:
+                results[configured_output] = {
+                    'success': False,
+                    'error': err,
+                }
+        return results
+
+    @staticmethod
+    def run_alerting(record):
+        """Create a fresh alerts processor and send the alert(s), returning the result"""
+        with patch.object(alert_processor, 'AlertTable'):
+            alert_proc = alert_processor.AlertProcessor()
+
+            return alert_proc.run(event=record.dynamo_record())
+
     def contains_rules(self, rules):
         if not rules:
             return True
 
         expected_rules = set(self.expected_trigger_rules) - rule.Rule.disabled_rules()
         return bool(expected_rules.intersection(rules))
+
+    def _install_lookup_tables_mocks(self, rules_engine_instance):
+        """
+        Extremely gnarly, extremely questionable manner to install mocking data into our tables.
+        The reason this exists at all is to support the secret features of table scanning S3-backed
+        tables, which isn't a "normally" available feature but is required for some pre-existing
+        StreamAlert users.
+        """
+        from streamalert.shared.lookup_tables.drivers import EphemeralDriver
+
+        dummy_configuration = {}
+        mock_data = self._lookup_tables_mock
+
+        # pylint: disable=protected-access
+        for table_name in rules_engine_instance._lookup_tables._tables.keys():
+            driver = EphemeralDriver(dummy_configuration)
+            driver._cache = mock_data.get(table_name, {})
+            ephemeral_table = LookupTable(table_name, driver, dummy_configuration)
+
+            rules_engine_instance._lookup_tables._tables[table_name] = ephemeral_table
 
     def _format_test_record(self):
         """Create a properly formatted Kinesis, S3, or SNS record.
@@ -234,7 +320,6 @@ class IntegrationTest:
             LOGGER.warning('Additional unnecessary keys in test event: %s', extra_keys)
 
         return True, None
-
 
     def _apply_defaults(self, test_event):
         """Apply default values to the given test event

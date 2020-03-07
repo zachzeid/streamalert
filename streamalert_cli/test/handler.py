@@ -16,21 +16,15 @@ limitations under the License.
 from collections import defaultdict
 import os
 
-from mock import patch, MagicMock
+from mock import patch
 
-from streamalert.alert_processor import main as alert_processor
-from streamalert.alert_processor.helpers import compose_alert
-from streamalert.alert_processor.outputs.output_base import OutputDispatcher
-from streamalert.rules_engine import rules_engine
 from streamalert.shared import rule
 from streamalert.shared.logger import get_logger
 from streamalert.shared.stats import RuleStatisticTracker
-from streamalert.shared.lookup_tables.table import LookupTable
 from streamalert_cli.helpers import check_credentials
 from streamalert_cli.test import DEFAULT_TEST_FILES_DIRECTORY
 from streamalert_cli.test.format import format_green, format_red, format_underline, format_yellow
 from streamalert_cli.test.integration_test import IntegrationTestFile
-from streamalert_cli.test.mocks import mock_lookup_table_results, mock_threat_intel_query_results
 from streamalert_cli.test.results import TestEventFile, TestResult
 from streamalert_cli.utils import CLICommand, generate_subparser, UniqueSetAction
 
@@ -217,8 +211,6 @@ class TestRunner:
         self._s3_mocker = patch('streamalert.classifier.payload.s3.boto3.resource').start()
         self._errors = defaultdict(list)  # cache errors to be logged at the endpoint
         self._tested_rules = set()
-        self._threat_intel_mock = mock_threat_intel_query_results()
-        self._lookup_tables_mock = mock_lookup_table_results()
         self._passed = 0
         self._failed = 0
         prefix = self._config['global']['account']['prefix']
@@ -236,53 +228,6 @@ class TestRunner:
             os.environ,
             env
         ).start()
-
-    def _run_rules_engine(self, record):
-        """Create a fresh rules engine and process the record, returning the result"""
-        with patch.object(rules_engine.ThreatIntel, '_query') as ti_mock, \
-             patch.object(rules_engine, 'AlertForwarder'), \
-             patch.object(rules_engine, 'RuleTable') as rule_table, \
-             patch('rules.helpers.base.random_bool', return_value=True):
-
-            # Emptying out the rule table will force all rules to be unstaged, which causes
-            # non-required outputs to get properly populated on the Alerts that are generated
-            # when running the Rules Engine.
-            rule_table.return_value = False
-            ti_mock.side_effect = self._threat_intel_mock
-
-            _rules_engine = rules_engine.RulesEngine()
-
-            self._install_lookup_tables_mocks(_rules_engine)
-
-            return _rules_engine.run(records=record)
-
-    def _install_lookup_tables_mocks(self, rules_engine_instance):
-        """
-        Extremely gnarly, extremely questionable manner to install mocking data into our tables.
-        The reason this exists at all is to support the secret features of table scanning S3-backed
-        tables, which isn't a "normally" available feature but is required for some pre-existing
-        StreamAlert users.
-        """
-        from streamalert.shared.lookup_tables.drivers import EphemeralDriver
-
-        dummy_configuration = {}
-        mock_data = self._lookup_tables_mock
-
-        # pylint: disable=protected-access
-        for table_name in rules_engine_instance._lookup_tables._tables.keys():
-            driver = EphemeralDriver(dummy_configuration)
-            driver._cache = mock_data.get(table_name, {})
-            ephemeral_table = LookupTable(table_name, driver, dummy_configuration)
-
-            rules_engine_instance._lookup_tables._tables[table_name] = ephemeral_table
-
-    @staticmethod
-    def _run_alerting(record):
-        """Create a fresh alerts processor and send the alert(s), returning the result"""
-        with patch.object(alert_processor, 'AlertTable'):
-            alert_proc = alert_processor.AlertProcessor()
-
-            return alert_proc.run(event=record.dynamo_record())
 
     def _check_prereqs(self):
         if self._type == self.Types.LIVE:
@@ -330,7 +275,6 @@ class TestRunner:
 
         print('\nRunning tests for files found in: {}'.format(self._files_dir))
 
-
         for file in self._get_test_files():
             test_file = IntegrationTestFile(
                 file.replace(self._files_dir, ''),
@@ -375,17 +319,17 @@ class TestRunner:
                     continue  # Do not run rules on events that are only for validation
 
                 if self._type in {self.Types.RULES, self.Types.LIVE}:
-                    alerts = self._run_rules_engine(classifier_result[0].sqs_messages)
+                    alerts = test.run_rules(classifier_result[0].sqs_messages)
                     test_result.alerts = alerts
 
                     if not test.skip_publishers:
                         for alert in alerts:
-                            publication_results = self._run_publishers(alert)
+                            publication_results = test.run_publishers(alert)
                             test_result.set_publication_results(publication_results)
 
                     if self._type == self.Types.LIVE:
                         for alert in alerts:
-                            alert_result = self._run_alerting(alert)
+                            alert_result = test.run_alerting(alert)
                             test_result.add_live_test_result(alert.rule_name, alert_result)
 
             self._passed += test_event.passed
@@ -400,38 +344,6 @@ class TestRunner:
         self._finalize()
 
         return self._failed == 0
-
-    @staticmethod
-    def _run_publishers(alert):
-        """Runs publishers for all currently configured outputs on the given alert
-
-        Args:
-            - alert (Alert): The alert
-
-        Returns:
-            dict: A dict keyed by output:descriptor strings, mapped to nested dicts.
-                  The nested dicts have 2 keys:
-                  - publication (dict): The dict publication
-                  - success (bool): True if the publishing finished, False if it errored.
-        """
-        configured_outputs = alert.outputs
-
-        results = {}
-        for configured_output in configured_outputs:
-            [output_name, descriptor] = configured_output.split(':')
-
-            try:
-                output = MagicMock(spec=OutputDispatcher, __service__=output_name)
-                results[configured_output] = {
-                    'publication': compose_alert(alert, output, descriptor),
-                    'success': True,
-                }
-            except (RuntimeError, TypeError, NameError) as err:
-                results[configured_output] = {
-                    'success': False,
-                    'error': err,
-                }
-        return results
 
     def _get_test_files(self):
         """Helper to get rule files to be tested
