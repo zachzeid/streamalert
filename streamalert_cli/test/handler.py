@@ -36,6 +36,7 @@ from streamalert.shared.lookup_tables.table import LookupTable
 from streamalert_cli.helpers import check_credentials
 from streamalert_cli.test import DEFAULT_TEST_FILES_DIRECTORY
 from streamalert_cli.test.format import format_green, format_red, format_underline, format_yellow
+from streamalert_cli.test.integration_test import IntegrationTestFile
 from streamalert_cli.test.mocks import mock_lookup_table_results, mock_threat_intel_query_results
 from streamalert_cli.test.results import TestEventFile, TestResult
 from streamalert_cli.utils import CLICommand, generate_subparser, UniqueSetAction
@@ -243,13 +244,6 @@ class TestRunner:
             env
         ).start()
 
-    @staticmethod
-    def _run_classification(record):
-        """Create a fresh classifier and classify the record, returning the result"""
-        with patch.object(classifier, 'SQSClient'), patch.object(classifier, 'FirehoseClient'):
-            _classifier = classifier.Classifier()
-            return _classifier.run(records=[record])
-
     def _run_rules_engine(self, record):
         """Create a fresh rules engine and process the record, returning the result"""
         with patch.object(rules_engine.ThreatIntel, '_query') as ti_mock, \
@@ -336,13 +330,6 @@ class TestRunner:
     def _testing_rules(self):
         return self._type in {self.Types.RULES, self.Types.LIVE}
 
-    def _contains_filtered_rules(self, event):
-        if not self._rules:
-            return True
-
-        expected_rules = set(event.get('trigger_rules', [])) - rule.Rule.disabled_rules()
-        return bool(expected_rules.intersection(self._rules))
-
     def run(self):
         """Run the tests"""
         if not self._check_prereqs():
@@ -351,29 +338,34 @@ class TestRunner:
         print('\nRunning tests for files found in: {}'.format(self._files_dir))
 
 
-        for event_file in self._get_test_files():
-            test_event = TestEventFile(event_file.replace(self._files_dir, ''))
-            # Iterate over the individual test events in the file
-            for idx, original_event, event in self._load_test_file(event_file):
-                if not event:
+        for file in self._get_test_files():
+            test_file = IntegrationTestFile(
+                file.replace(self._files_dir, ''),
+                file,
+                self._config
+            )
+
+            # FIXME (ryxias) refactor this
+            test_event = TestEventFile(file.replace(self._files_dir, ''))
+
+            for test in test_file.tests:
+                if not test.valid:
                     continue
 
-                if not self._contains_filtered_rules(original_event):
+                if not test.contains_rules(self._rules):
                     continue
-
-                resource = original_event['source']
 
                 for cluster_name, cluster_value in self._config['clusters'].items():
                     for service in cluster_value['data_sources'].values():
-                        if resource in service:
+                        if test.resource in service:
                             os.environ['CLUSTER'] = cluster_name
                             break
 
-                classifier_result = self._run_classification(event)
+                classifier_result = test.run_classification()
 
                 test_result = TestResult(
-                    idx,
-                    original_event,
+                    test.testfile_index,
+                    test.config,
                     classifier_result[0] if classifier_result else False,
                     with_rules=self._testing_rules,
                     verbose=self._verbose
@@ -386,14 +378,14 @@ class TestRunner:
                 if not test_result:
                     continue
 
-                if original_event.get('validate_schema_only'):
+                if test.is_validate_schema_only:
                     continue  # Do not run rules on events that are only for validation
 
                 if self._type in {self.Types.RULES, self.Types.LIVE}:
                     alerts = self._run_rules_engine(classifier_result[0].sqs_messages)
                     test_result.alerts = alerts
 
-                    if not original_event.get('skip_publishers'):
+                    if not test.skip_publishers:
                         for alert in alerts:
                             publication_results = self._run_publishers(alert)
                             test_result.set_publication_results(publication_results)
@@ -472,11 +464,6 @@ class TestRunner:
         for basename in files_filter:
             self._append_error('No test event file found with base name \'{}\''.format(basename))
 
-    def _setup_s3_mock(self, data):
-        self._s3_mocker.return_value.Bucket.return_value.download_fileobj = (
-            lambda k, d: d.write(json.dumps(data).encode())
-        )
-
     def _append_error(self, error, path=None, idx=None):
         key = 'error'
         if path:
@@ -484,275 +471,4 @@ class TestRunner:
         key = key if not idx else '{}:{}'.format(key, idx)
         self._errors[key].append(error)
 
-    def _load_test_file(self, path):
-        """Helper to json load the contents of a file with some error handling
 
-        Test files should be formatted as:
-
-        [
-            {
-                "data": {},
-                "description": "...",
-                "...": "..."
-            }
-        ]
-
-        Args:
-            path (str): Relative path to file on disk
-
-        Returns:
-            dict: Loaded JSON from test event file
-        """
-        with open(path, 'r') as test_event_file:
-            try:
-                data = json.load(test_event_file)
-            except (ValueError, TypeError):
-                self._append_error('Test event file is not valid JSON', path=path)
-                return
-
-            if not isinstance(data, list):
-                self._append_error('Test event file is improperly formatted', path=path)
-                return
-
-            for idx, event in enumerate(data):
-                valid, record = self._format_test_record(event)
-                if not valid:
-                    self._append_error(record, path=path, idx=idx)
-                    continue
-                yield idx, event, record
-
-    def _format_test_record(self, test_event):
-        """Create a properly formatted Kinesis, S3, or SNS record.
-
-        Supports a dictionary or string based data record.  Reads in
-        event templates from the tests/integration/templates folder.
-
-        Args:
-            test_event (dict): Test event metadata dict with the following structure:
-                data|override_record - string or dict of the raw data
-                description - a string describing the test that is being performed
-                trigger - bool of if the record should produce an alert
-                source - which stream/s3 bucket originated the data
-                service - which aws service originated the data
-                compress (optional) - if the payload needs to be gzip compressed or not
-
-        Returns:
-            dict: in the format of the specific service
-        """
-        valid, error = self._validate_test_event(test_event)
-        if not valid:
-            return False, error
-
-        self._apply_helpers(test_event)
-        self._apply_defaults(test_event)
-
-        data = test_event['data']
-        if isinstance(data, dict):
-            data = json.dumps(data)
-        elif not isinstance(data, str):
-            return False, 'Invalid data type: {}'.format(type(data))
-
-        if test_event['service'] not in {'s3', 'kinesis', 'sns', 'streamalert_app'}:
-            return False, 'Unsupported service: {}'.format(test_event['service'])
-
-        # Get a formatted record for this particular service
-        return True, self._apply_service_template(
-            test_event['service'],
-            test_event['source'],
-            data,
-            test_event.get('compress', False)
-        )
-
-    def _apply_service_template(self, service, source, data, compress=False):
-        """Provides a pre-configured template that reflects incoming payload from a service
-
-        Args:
-            service (str): The service for the payload template
-
-        Returns:
-            dict: Template of the payload for the given service
-        """
-        if service == 's3':
-            # Assign the s3 mock for this data
-            self._setup_s3_mock(data)
-            return {
-                'eventVersion': '2.0',
-                'eventTime': '1970-01-01T00:00:00.000Z',
-                'requestParameters': {
-                    'sourceIPAddress': '127.0.0.1'
-                },
-                's3': {
-                    'configurationId': ',,,',
-                    'object': {
-                        'eTag': '...',
-                        'sequencer': '...',
-                        'key': 'test_object_key',
-                        'size': len(data)
-                    },
-                    'bucket': {
-                        'arn': 'arn:aws:s3:::{}'.format(source),
-                        'name': source,
-                        'ownerIdentity': {
-                            'principalId': 'EXAMPLE'
-                        }
-                    },
-                    's3SchemaVersion': '1.0'
-                },
-                'responseElements': {
-                    'x-amz-id-2': (
-                        'EXAMPLE123/foo/bar'
-                    ),
-                    'x-amz-request-id': '...'
-                },
-                'awsRegion': 'us-east-1',
-                'eventName': 'ObjectCreated:Put',
-                'userIdentity': {
-                    'principalId': 'EXAMPLE'
-                },
-                'eventSource': 'aws:s3'
-            }
-
-        if service == 'kinesis':
-            if compress:
-                data = zlib.compress(data)
-
-            kinesis_data = base64.b64encode(data.encode())
-
-            return {
-                'eventID': '...',
-                'eventVersion': '1.0',
-                'kinesis': {
-                    'approximateArrivalTimestamp': 1428537600,
-                    'partitionKey': 'partitionKey-3',
-                    'data': kinesis_data,
-                    'kinesisSchemaVersion': '1.0',
-                    'sequenceNumber': ',,,'
-                },
-                'invokeIdentityArn': 'arn:aws:iam::EXAMPLE',
-                'eventName': 'aws:kinesis:record',
-                'eventSourceARN': 'arn:aws:kinesis:us-east-1:123456789012:stream/{}'.format(
-                    source
-                ),
-                'eventSource': 'aws:kinesis',
-                'awsRegion': 'us-east-1'
-            }
-
-        if service == 'sns':
-            return {
-                'EventVersion': '1.0',
-                'EventSubscriptionArn': 'arn:aws:sns:us-east-1:123456789012:{}'.format(source),
-                'EventSource': 'aws:sns',
-                'Sns': {
-                    'SignatureVersion': '1',
-                    'Timestamp': '1970-01-01T00:00:00.000Z',
-                    'Signature': 'EXAMPLE',
-                    'SigningCertUrl': 'EXAMPLE',
-                    'MessageId': '95df01b4-ee98-5cb9-9903-4c221d41eb5e',
-                    'Message': data,
-                    'MessageAttributes': {
-                        'Test': {
-                            'Type': 'String',
-                            'Value': 'TestString'
-                        }
-                    },
-                    'Type': 'Notification',
-                    'UnsubscribeUrl': '...',
-                    'TopicArn': 'arn:aws:sns:us-east-1:123456789012:{}'.format(source),
-                    'Subject': '...'
-                }
-            }
-
-        if service == 'streamalert_app':
-            return {'streamalert_app': source, 'logs': [data]}
-
-    @staticmethod
-    def _validate_test_event(test_event):
-        """Check if the test event contains the required keys
-
-        Args:
-            test_event (dict): The loaded test event from json
-
-        Returns:
-            bool: True if the proper keys are present
-        """
-        required_keys = {'description', 'log', 'service', 'source'}
-
-        test_event_keys = set(test_event)
-        if not required_keys.issubset(test_event_keys):
-            req_key_diff = required_keys.difference(test_event_keys)
-            missing_keys = ', '.join('\'{}\''.format(key) for key in req_key_diff)
-            return False, 'Missing required key(s) in test event: {}'.format(missing_keys)
-
-        acceptable_data_keys = {'data', 'override_record'}
-        if not test_event_keys & acceptable_data_keys:
-            return False, 'Test event must contain either \'data\' or \'override_record\''
-
-        optional_keys = {'compress', 'trigger_rules', 'validate_schema_only'}
-
-        key_diff = test_event_keys.difference(required_keys | optional_keys | acceptable_data_keys)
-
-        # Log a warning if there are extra keys declared in the test log
-        if key_diff:
-            extra_keys = ', '.join('\'{}\''.format(key) for key in key_diff)
-            LOGGER.warning('Additional unnecessary keys in test event: %s', extra_keys)
-
-        return True, None
-
-    def _apply_defaults(self, test_event):
-        """Apply default values to the given test event
-
-        Args:
-            test_event (dict): The loaded test event
-        """
-        if 'override_record' not in test_event:
-            return
-
-        event_log = self._config['logs'].get(test_event['log'])
-
-        configuration = event_log.get('configuration', {})
-        schema = configuration.get('envelope_keys', event_log['schema'])
-
-        # Add apply default values based on the declared schema
-        default_test_event = {
-            key: ParserBase.default_optional_values(value)
-            for key, value in schema.items()
-        }
-
-        # Overwrite the fields included in the 'override_record' field,
-        # and update the test event with a full 'data' key
-        default_test_event.update(test_event['override_record'])
-        test_event['data'] = default_test_event
-
-    @staticmethod
-    def _apply_helpers(test_record):
-        """Detect and apply helper functions to test event data
-
-        Helpers are declared in test fixtures via the following keyword:
-        "<helpers:helper_name>"
-
-        Supported helper functions:
-            last_hour: return the current epoch time minus 60 seconds to pass the
-                       last_hour rule helper.
-
-        Args:
-            test_record (dict): loaded fixture file JSON as a dict.
-        """
-        # declare all helper functions here, they should always return a string
-        record_helpers = {
-            'last_hour': lambda: str(int(time.time()) - 60)
-        }
-        helper_regex = re.compile(r'<helper:(?P<helper>\w+)>')
-
-        def _find_and_apply_helpers(test_record):
-            """Apply any helpers to the passed in test_record"""
-            for key, value in test_record.items():
-                if isinstance(value, str):
-                    test_record[key] = re.sub(
-                        helper_regex,
-                        lambda match: record_helpers[match.group('helper')](),
-                        value
-                    )
-                elif isinstance(value, dict):
-                    _find_and_apply_helpers(test_record[key])
-
-        _find_and_apply_helpers(test_record)
