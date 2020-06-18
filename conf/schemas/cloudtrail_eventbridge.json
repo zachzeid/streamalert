@@ -1,0 +1,19 @@
+{
+  "cloudtrail_eventbridge:events": {
+    "schema": {
+      "account": "string",
+      "detail": {},
+      "detail-type": "string",
+      "id": "string",
+      "region": "string",
+      "resources": [],
+      "source": "string",
+      "time": "string",
+      "version": "string"
+    },
+    "parser": "json",
+    "configuration": {
+      "json_path": "Records[*]"
+    }
+  }
+}
